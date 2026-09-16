@@ -6,3 +6,6 @@
 *.csv
 *.eml
 *.msg
+
+__pycache__/
+*.pyc

@@ -1,7 +1,7 @@
 # DMARC Rawdogger
 
 A small, dependency-free Python tool that turns raw DMARC aggregate reports
-into a human-readable summary.
+into a human-readable summary — as a CLI or as a local browser dashboard.
 
 It accepts the report in whatever form it actually shows up in:
 
@@ -14,7 +14,30 @@ It accepts the report in whatever form it actually shows up in:
 
 - Python 3.8+ (standard library only, no extra packages to install)
 
-## Usage
+## Browser UI
+
+`dmarc_web.py` runs a small local web server with a drag-and-drop-style upload
+form and a visual report: KPI tiles, a pass/fail breakdown bar, a top-source-IP
+chart, the published policy, and the full record table.
+
+```
+python dmarc_web.py
+```
+
+This opens `http://127.0.0.1:8787/` in your default browser. Upload a report
+file there to see the dashboard. The server only binds to your local machine
+(`127.0.0.1`) — it's not reachable from the network — and uploaded files are
+processed in memory/a temp file and deleted immediately after rendering,
+nothing is persisted.
+
+Options:
+
+```
+python dmarc_web.py --port 9000       # use a different port
+python dmarc_web.py --no-browser      # don't auto-open a browser tab
+```
+
+## Command line
 
 ```
 python dmarc_rawdogger.py <input-file> [-o output.txt]
