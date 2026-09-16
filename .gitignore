@@ -1,0 +1,8 @@
+# Real DMARC report data (contains IPs, domains, emails) - keep local only
+*.xml.gz
+*.gz
+*.zip
+*.xml
+*.csv
+*.eml
+*.msg
