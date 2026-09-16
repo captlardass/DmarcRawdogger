@@ -37,6 +37,33 @@ python dmarc_web.py --port 9000       # use a different port
 python dmarc_web.py --no-browser      # don't auto-open a browser tab
 ```
 
+### SPF cross-check
+
+Every report view has a "Check SPF now" box. It does a **live DNS lookup** of
+the domain's current SPF TXT record and compares it against what the report
+recorded for each source IP, so you can see whether the two are in sync or
+whether the SPF record needs to be updated.
+
+For each source IP it shows the result the report saw at delivery time next
+to what the *current* published record would produce today, and flags any
+drift — e.g. a source that used to pass but would now fail (often means a
+legitimate sender got dropped from the record), or one that used to fail but
+would now pass. It also flags general SPF hygiene problems: more than 10
+DNS-lookup mechanisms (RFC 7208's hard cap — beyond it receivers treat the
+record as broken), a missing or catch-all (`+all`) `all` mechanism, or
+multiple SPF records published for the same domain (invalid — causes every
+check to fail).
+
+This does a real outbound DNS query (UDP port 53, no external packages —
+it's a small built-in DNS client) to `1.1.1.1` / `8.8.8.8`, so it needs
+unfiltered outbound DNS access. If your network blocks that, the panel will
+say so instead of hanging. Since SPF records are public DNS data, no
+credentials or private information are involved.
+
+This is a best-effort evaluator for diagnosing drift, not an RFC-7208-exact
+implementation — SPF macros (`exists:`, `%{i}`) and the deprecated `ptr`
+mechanism are skipped rather than evaluated.
+
 ## Command line
 
 ```

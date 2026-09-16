@@ -8,13 +8,29 @@ import argparse
 import html
 import os
 import tempfile
+import uuid
 import webbrowser
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 import dmarc_rawdogger as core
+import spf_check
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
+MAX_STORED_REPORTS = 20
+
+# In-memory store so the "Check SPF" form can re-fetch an already-parsed report
+# without re-uploading it. Local single-user tool - no persistence, no auth needed.
+REPORTS = OrderedDict()
+
+
+def _store_report(report: dict) -> str:
+    token = uuid.uuid4().hex
+    REPORTS[token] = report
+    while len(REPORTS) > MAX_STORED_REPORTS:
+        REPORTS.popitem(last=False)
+    return token
 
 PAGE_HEAD = """<!doctype html>
 <html lang="en">
@@ -35,6 +51,8 @@ PAGE_HEAD = """<!doctype html>
     --border:         rgba(11,11,11,0.10);
     --seq-blue:       #2a78d6;
     --status-good:     #0ca30c;
+    --status-warning:  #fab219;
+    --status-serious:  #ec835a;
     --status-critical: #d03b3b;
   }
   * { box-sizing: border-box; }
@@ -136,6 +154,28 @@ PAGE_HEAD = """<!doctype html>
   .status-badge.pass { color: var(--status-good); }
   .status-badge.fail .dot { background: var(--status-critical); }
   .status-badge.fail { color: var(--status-critical); }
+  .status-badge.match .dot { background: var(--status-good); }
+  .status-badge.match { color: var(--status-good); }
+  .status-badge.drift .dot { background: var(--status-critical); }
+  .status-badge.drift { color: var(--status-critical); }
+
+  /* SPF cross-check */
+  .spf-form { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 0; }
+  .spf-form input[type=text] {
+    flex: 1 1 220px; padding: 8px 10px; border: 1px solid var(--baseline);
+    border-radius: 6px; font-size: 14px; font-family: inherit;
+  }
+  code.spf-raw {
+    display: block; padding: 10px 12px; background: var(--page); border-radius: 6px;
+    font-size: 13px; word-break: break-all; color: var(--text-primary);
+  }
+  ul.warning-list { margin: 12px 0 0; padding-left: 20px; color: var(--status-serious); font-size: 13px; }
+  ul.warning-list li { margin-bottom: 6px; }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 10px; font-size: 12px; font-weight: 600; color: #fff; }
+  .pill-good { background: var(--status-good); }
+  .pill-critical { background: var(--status-critical); }
+  .pill-serious { background: var(--status-serious); }
+  .pill-warning { background: var(--status-warning); color: #3a2c00; }
 
   .error { color: var(--status-critical); font-weight: 600; }
   a.back { color: var(--seq-blue); text-decoration: none; font-size: 14px; }
@@ -181,7 +221,91 @@ def render_error_page(message: str) -> str:
     )
 
 
-def render_report_html(report: dict) -> str:
+SPF_RESULT_COLOR = {
+    "pass": "good", "fail": "critical", "softfail": "serious",
+    "permerror": "critical", "unknown": "warning",
+}
+
+
+def _spf_pill(result: str) -> str:
+    result = result or "-"
+    color_key = SPF_RESULT_COLOR.get(result)
+    if not color_key:
+        return f'<span style="color:var(--text-muted)">{esc(result)}</span>'
+    return f'<span class="pill pill-{color_key}">{esc(result)}</span>'
+
+
+def render_spf_form(token: str, domain: str) -> str:
+    return f"""
+<div class="card">
+  <h2>SPF cross-check</h2>
+  <p class="hint" style="margin:0 0 12px;">
+    Look up the domain's live SPF record right now and compare it against what this
+    report saw at delivery time - useful for catching drift after an SPF edit.
+  </p>
+  <form class="spf-form" method="GET" action="/spf-check">
+    <input type="hidden" name="token" value="{esc(token)}">
+    <input type="text" name="domain" value="{esc(domain)}" placeholder="domain to check">
+    <button type="submit">Check SPF now</button>
+  </form>
+</div>
+"""
+
+
+def render_spf_panel(spf_result: dict) -> str:
+    health = spf_result.get("health") or {}
+    rows = spf_result.get("rows") or []
+    parts = ['<div class="card"><h2>Live SPF record</h2>']
+
+    if health.get("error"):
+        parts.append(f'<p class="error">{esc(health["error"])}</p>')
+    elif health.get("record"):
+        parts.append(f'<code class="spf-raw">{esc(health["record"])}</code>')
+        parts.append(
+            f'<div class="hint" style="margin-top:8px;">'
+            f'DNS-lookup mechanisms used: {health.get("lookup_count", "-")} / 10</div>'
+        )
+    else:
+        parts.append('<p style="color:var(--text-muted)">No SPF record is currently published for this domain.</p>')
+
+    if health.get("warnings"):
+        parts.append('<ul class="warning-list">')
+        for w in health["warnings"]:
+            parts.append(f'<li>{esc(w)}</li>')
+        parts.append('</ul>')
+    parts.append('</div>')
+
+    parts.append('<div class="card"><h2>Report vs. live record</h2>')
+    if rows:
+        parts.append(
+            '<table><thead><tr>'
+            '<th>Source IP</th><th>Checked domain</th><th class="num">Count</th>'
+            '<th>Report said</th><th>Live SPF says</th><th>Status</th>'
+            '</tr></thead><tbody>'
+        )
+        for row in rows:
+            status_class = "drift" if row["drift"] else "match"
+            status_label = "Needs attention" if row["drift"] else "In sync"
+            parts.append(
+                '<tr>'
+                f'<td>{esc(row["ip"])}</td>'
+                f'<td>{esc(row["domain"])}</td>'
+                f'<td class="num">{row["count"]}</td>'
+                f'<td>{_spf_pill(row["reported_result"])}</td>'
+                f'<td>{_spf_pill(row["live_result"])} '
+                f'<span class="hint" style="display:inline">({esc(row["live_reason"])})</span></td>'
+                f'<td><span class="status-badge {status_class}"><span class="dot"></span>{status_label}</span></td>'
+                '</tr>'
+            )
+        parts.append('</tbody></table>')
+    else:
+        parts.append('<p style="color:var(--text-muted)">No source IPs to check.</p>')
+    parts.append('</div>')
+
+    return "".join(parts)
+
+
+def render_report_html(report: dict, token: str = None, spf_result: dict = None, spf_domain: str = None) -> str:
     records = report["records"]
     total = sum(int(r["count"] or 0) for r in records)
     passed = sum(
@@ -244,6 +368,12 @@ def render_report_html(report: dict) -> str:
             '</div>'
         )
         parts.append('</div>')
+
+    # SPF cross-check
+    if token:
+        parts.append(render_spf_form(token, spf_domain or report.get("policy_domain") or ""))
+        if spf_result:
+            parts.append(render_spf_panel(spf_result))
 
     # Top source IPs bar chart
     by_ip = {}
@@ -347,11 +477,33 @@ class Handler(BaseHTTPRequestHandler):
         pass  # keep the console quiet
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path == "/":
             self._send_html(PAGE_HEAD + UPLOAD_FORM + PAGE_TAIL)
+        elif path == "/spf-check":
+            self._handle_spf_check(parse_qs(parsed.query))
         else:
             self.send_error(404, "Not found")
+
+    def _handle_spf_check(self, params: dict):
+        token = (params.get("token") or [""])[0]
+        domain = (params.get("domain") or [""])[0].strip()
+        report = REPORTS.get(token)
+        if report is None:
+            self._send_html(
+                render_error_page("This report session has expired - please upload the report again."),
+                status=400,
+            )
+            return
+
+        domain = domain or report.get("policy_domain") or ""
+        try:
+            spf_result = spf_check.cross_check_report(report, domain=domain)
+        except Exception as exc:
+            spf_result = {"policy_domain": domain, "health": {"error": str(exc)}, "rows": []}
+
+        self._send_html(render_report_html(report, token=token, spf_result=spf_result, spf_domain=domain))
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -386,7 +538,8 @@ class Handler(BaseHTTPRequestHandler):
                 tmp.write(data)
                 tmp_path = tmp.name
             report = core.load_report(tmp_path)
-            self._send_html(render_report_html(report))
+            token = _store_report(report)
+            self._send_html(render_report_html(report, token=token))
         except Exception as exc:
             self._send_html(render_error_page(str(exc)), status=400)
         finally:
