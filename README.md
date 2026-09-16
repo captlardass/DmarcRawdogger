@@ -39,10 +39,10 @@ python dmarc_web.py --no-browser      # don't auto-open a browser tab
 
 ### SPF cross-check
 
-Every report view has a "Check SPF now" box. It does a **live DNS lookup** of
-the domain's current SPF TXT record and compares it against what the report
-recorded for each source IP, so you can see whether the two are in sync or
-whether the SPF record needs to be updated.
+As soon as a report is analyzed, it automatically does a **live DNS lookup**
+of the report's top-level (policy) domain's current SPF TXT record and
+compares it against what the report recorded for each source IP checked
+against that domain — no extra click needed.
 
 For each source IP it shows the result the report saw at delivery time next
 to what the *current* published record would produce today, and flags any
@@ -53,6 +53,14 @@ DNS-lookup mechanisms (RFC 7208's hard cap — beyond it receivers treat the
 record as broken), a missing or catch-all (`+all`) `all` mechanism, or
 multiple SPF records published for the same domain (invalid — causes every
 check to fail).
+
+Any source IPs that were SPF-checked against a *different* domain in the
+report (typically a subdomain, e.g. `bounce.example.com`) are cross-checked
+too, but kept out of the way behind a collapsed **"Show subdomains"** toggle
+under the main table, so the top-level result stays the headline.
+
+Below that, a "Check SPF now" box lets you re-run the check against any other
+domain on demand (handy right after editing a record, to confirm the fix).
 
 This does a real outbound DNS query (UDP port 53, no external packages —
 it's a small built-in DNS client) to `1.1.1.1` / `8.8.8.8`, so it needs

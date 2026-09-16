@@ -171,6 +171,15 @@ PAGE_HEAD = """<!doctype html>
   }
   ul.warning-list { margin: 12px 0 0; padding-left: 20px; color: var(--status-serious); font-size: 13px; }
   ul.warning-list li { margin-bottom: 6px; }
+  details.subdomain-toggle { margin-top: 16px; }
+  details.subdomain-toggle summary {
+    cursor: pointer; font-size: 13px; font-weight: 600; color: var(--seq-blue);
+    list-style: none; user-select: none;
+  }
+  details.subdomain-toggle summary::-webkit-details-marker { display: none; }
+  details.subdomain-toggle summary::before { content: "\25b8  "; }
+  details.subdomain-toggle[open] summary::before { content: "\25be  "; }
+  details.subdomain-toggle table { margin-top: 12px; }
   .pill { display: inline-block; padding: 2px 9px; border-radius: 10px; font-size: 12px; font-weight: 600; color: #fff; }
   .pill-good { background: var(--status-good); }
   .pill-critical { background: var(--status-critical); }
@@ -240,8 +249,8 @@ def render_spf_form(token: str, domain: str) -> str:
 <div class="card">
   <h2>SPF cross-check</h2>
   <p class="hint" style="margin:0 0 12px;">
-    Look up the domain's live SPF record right now and compare it against what this
-    report saw at delivery time - useful for catching drift after an SPF edit.
+    The top-level domain was checked automatically below. Enter a different
+    domain here to cross-check it too - useful after editing the SPF record.
   </p>
   <form class="spf-form" method="GET" action="/spf-check">
     <input type="hidden" name="token" value="{esc(token)}">
@@ -252,9 +261,38 @@ def render_spf_form(token: str, domain: str) -> str:
 """
 
 
+def _spf_rows_table(rows: list) -> str:
+    parts = [
+        '<table><thead><tr>'
+        '<th>Source IP</th><th>Checked domain</th><th class="num">Count</th>'
+        '<th>Report said</th><th>Live SPF says</th><th>Status</th>'
+        '</tr></thead><tbody>'
+    ]
+    for row in rows:
+        status_class = "drift" if row["drift"] else "match"
+        status_label = "Needs attention" if row["drift"] else "In sync"
+        parts.append(
+            '<tr>'
+            f'<td>{esc(row["ip"])}</td>'
+            f'<td>{esc(row["domain"])}</td>'
+            f'<td class="num">{row["count"]}</td>'
+            f'<td>{_spf_pill(row["reported_result"])}</td>'
+            f'<td>{_spf_pill(row["live_result"])} '
+            f'<span class="hint" style="display:inline">({esc(row["live_reason"])})</span></td>'
+            f'<td><span class="status-badge {status_class}"><span class="dot"></span>{status_label}</span></td>'
+            '</tr>'
+        )
+    parts.append('</tbody></table>')
+    return "".join(parts)
+
+
 def render_spf_panel(spf_result: dict) -> str:
     health = spf_result.get("health") or {}
+    policy_domain = (spf_result.get("policy_domain") or "").lower()
     rows = spf_result.get("rows") or []
+    top_rows = [r for r in rows if r["domain"].lower() == policy_domain]
+    sub_rows = [r for r in rows if r["domain"].lower() != policy_domain]
+
     parts = ['<div class="card"><h2>Live SPF record</h2>']
 
     if health.get("error"):
@@ -275,31 +313,19 @@ def render_spf_panel(spf_result: dict) -> str:
         parts.append('</ul>')
     parts.append('</div>')
 
-    parts.append('<div class="card"><h2>Report vs. live record</h2>')
-    if rows:
-        parts.append(
-            '<table><thead><tr>'
-            '<th>Source IP</th><th>Checked domain</th><th class="num">Count</th>'
-            '<th>Report said</th><th>Live SPF says</th><th>Status</th>'
-            '</tr></thead><tbody>'
-        )
-        for row in rows:
-            status_class = "drift" if row["drift"] else "match"
-            status_label = "Needs attention" if row["drift"] else "In sync"
-            parts.append(
-                '<tr>'
-                f'<td>{esc(row["ip"])}</td>'
-                f'<td>{esc(row["domain"])}</td>'
-                f'<td class="num">{row["count"]}</td>'
-                f'<td>{_spf_pill(row["reported_result"])}</td>'
-                f'<td>{_spf_pill(row["live_result"])} '
-                f'<span class="hint" style="display:inline">({esc(row["live_reason"])})</span></td>'
-                f'<td><span class="status-badge {status_class}"><span class="dot"></span>{status_label}</span></td>'
-                '</tr>'
-            )
-        parts.append('</tbody></table>')
+    parts.append(f'<div class="card"><h2>Report vs. live record - {esc(policy_domain or "top-level domain")}</h2>')
+    if top_rows:
+        parts.append(_spf_rows_table(top_rows))
     else:
-        parts.append('<p style="color:var(--text-muted)">No source IPs to check.</p>')
+        parts.append('<p style="color:var(--text-muted)">No source IPs were checked directly against the top-level domain.</p>')
+
+    if sub_rows:
+        parts.append(
+            f'<details class="subdomain-toggle">'
+            f'<summary>Show subdomains ({len(sub_rows)})</summary>'
+            f'{_spf_rows_table(sub_rows)}'
+            f'</details>'
+        )
     parts.append('</div>')
 
     return "".join(parts)
@@ -539,7 +565,14 @@ class Handler(BaseHTTPRequestHandler):
                 tmp_path = tmp.name
             report = core.load_report(tmp_path)
             token = _store_report(report)
-            self._send_html(render_report_html(report, token=token))
+            policy_domain = report.get("policy_domain") or ""
+            try:
+                spf_result = spf_check.cross_check_report(report, domain=policy_domain) if policy_domain else None
+            except Exception as exc:
+                spf_result = {"policy_domain": policy_domain, "health": {"error": str(exc)}, "rows": []}
+            self._send_html(render_report_html(
+                report, token=token, spf_result=spf_result, spf_domain=policy_domain
+            ))
         except Exception as exc:
             self._send_html(render_error_page(str(exc)), status=400)
         finally:
